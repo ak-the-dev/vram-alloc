@@ -1,0 +1,27 @@
+# Build artifacts
+MemVRAM
+/vram-alloc
+/m
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go work/cache
+.gocache/
+.gomodcache/
+.gopath/
+coverage.out
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
