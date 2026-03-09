@@ -17,9 +17,13 @@ import (
 )
 
 const (
-	updateInterval = 3 * time.Second
-	commandTimeout = 5 * time.Second
-	vramSysctlKey  = "iogpu.wired_limit_mb"
+	updateInterval       = 3 * time.Second
+	readCommandTimeout   = 5 * time.Second
+	notifyCommandTimeout = 3 * time.Second
+	sysctlPath           = "/usr/sbin/sysctl"
+	osascriptPath        = "/usr/bin/osascript"
+	vramSysctlKey        = "iogpu.wired_limit_mb"
+	defaultVRAMLimitMB   = 0
 
 	minPresetPercent = 5
 	maxPresetPercent = 90
@@ -35,6 +39,21 @@ type vramPreset struct {
 	Percent int
 }
 
+type commandSpec struct {
+	label   string
+	path    string
+	args    []string
+	timeout time.Duration
+}
+
+type refreshSnapshot struct {
+	hasRAM      bool
+	usedBytes   uint64
+	totalBytes  uint64
+	usedPercent float64
+	vramLimitMB int
+}
+
 var (
 	isAppleSilicon bool
 	ramDetailItem  *systray.MenuItem
@@ -44,6 +63,9 @@ var (
 	totalMemoryMB  int
 	maxVRAMLimitMB int
 	updateMu       sync.Mutex
+
+	virtualMemoryReader    = mem.VirtualMemory
+	currentVRAMLimitReader = getCurrentVRAMLimitMB
 )
 
 func main() {
@@ -59,7 +81,7 @@ func checkAppleSilicon() {
 	// Default to true for darwin/arm64, then verify via CPU brand string when available.
 	isAppleSilicon = true
 
-	out, err := commandOutput("sysctl", "-n", "machdep.cpu.brand_string")
+	out, err := executeOutput(sysctlReadSpec("-n", "machdep.cpu.brand_string"))
 	if err != nil {
 		return
 	}
@@ -85,12 +107,17 @@ func onReady() {
 				"Detected physical memory",
 			)
 			item.Disable()
-		}
-
-		if maxVRAMLimitMB > 0 {
+			if maxVRAMLimitMB > 0 {
+				item := systray.AddMenuItem(
+					fmt.Sprintf("Max VRAM Limit: %d MB (%s)", maxVRAMLimitMB, formatGBFromMB(maxVRAMLimitMB)),
+					"App safety cap at 90% of total memory",
+				)
+				item.Disable()
+			}
+		} else {
 			item := systray.AddMenuItem(
-				fmt.Sprintf("Max VRAM Limit: %d MB (%s)", maxVRAMLimitMB, formatGBFromMB(maxVRAMLimitMB)),
-				"App safety cap at 90% of total memory",
+				"Total Memory: unavailable",
+				"VRAM controls are disabled until total memory can be detected",
 			)
 			item.Disable()
 		}
@@ -99,41 +126,51 @@ func onReady() {
 		vramDetailItem = systray.AddMenuItem("VRAM: Detecting...", "Current GPU memory limit")
 		vramDetailItem.Disable()
 
-		menuHelp := "Set iogpu.wired_limit_mb (admin required)"
-		if maxVRAMLimitMB > 0 {
-			menuHelp = fmt.Sprintf("Set 0..%d MB (admin required)", maxVRAMLimitMB)
-		}
-		vramMenu := systray.AddMenuItem("Set VRAM Limit", menuHelp)
+		if totalMemoryMB > 0 {
+			menuHelp := fmt.Sprintf("Set 0..%d MB (admin required)", maxVRAMLimitMB)
+			vramMenu := systray.AddMenuItem("Set VRAM Limit", menuHelp)
 
-		// Dynamic (Auto)
-		dynamic := vramMenu.AddSubMenuItem("Dynamic (0 MB)", "Let macOS manage automatically")
-		go watchVRAMSelection(dynamic, 0)
+			resetDefault := vramMenu.AddSubMenuItem(
+				"Reset to Default",
+				"Restore the default macOS-managed VRAM configuration",
+			)
+			go func() {
+				for range resetDefault.ClickedCh {
+					applyDefaultVRAMLimit()
+				}
+			}()
 
-		// Generate dynamic presets
-		totalMemMB := totalMemoryMB
-		if totalMemMB == 0 {
-			totalMemMB = getTotalMemoryMB()
-		}
-		for _, preset := range buildVRAMPresets(totalMemMB) {
-			item := vramMenu.AddSubMenuItem(preset.Label, fmt.Sprintf("Set %d MB", preset.MB))
-			go watchVRAMSelection(item, preset.MB)
-		}
+			// Dynamic (Auto)
+			dynamic := vramMenu.AddSubMenuItem("Dynamic (0 MB)", "Let macOS manage automatically")
+			go watchVRAMSelection(dynamic, 0)
 
-		custom := vramMenu.AddSubMenuItem("Custom...", "Enter specific MB value")
-		go func() {
-			for range custom.ClickedCh {
-				mb, err := promptCustomVRAM()
-				if err != nil {
-					if errors.Is(err, errUserCanceled) {
-						setActionStatus("Custom prompt canceled")
+			for _, preset := range buildVRAMPresets(totalMemoryMB) {
+				item := vramMenu.AddSubMenuItem(preset.Label, fmt.Sprintf("Set %d MB", preset.MB))
+				go watchVRAMSelection(item, preset.MB)
+			}
+
+			custom := vramMenu.AddSubMenuItem("Custom...", "Enter specific MB value")
+			go func() {
+				for range custom.ClickedCh {
+					mb, err := promptCustomVRAM()
+					if err != nil {
+						if errors.Is(err, errUserCanceled) {
+							setActionStatus("Custom prompt canceled")
+							continue
+						}
+						setActionStatus(fmt.Sprintf("Invalid custom value: %v", err))
 						continue
 					}
-					setActionStatus(fmt.Sprintf("Invalid custom value: %v", err))
-					continue
+					applyVRAMLimit(mb)
 				}
-				applyVRAMLimit(mb)
-			}
-		}()
+			}()
+		} else {
+			item := systray.AddMenuItem(
+				"Set VRAM Limit: unavailable",
+				"Controls are disabled because total memory could not be detected",
+			)
+			item.Disable()
+		}
 	} else {
 		vramDetailItem = systray.AddMenuItem("VRAM control: Apple Silicon only", "Requires macOS arm64")
 		vramDetailItem.Disable()
@@ -147,8 +184,7 @@ func onReady() {
 	refreshNow := systray.AddMenuItem("Refresh Now", "Refresh RAM and VRAM status immediately")
 	go func() {
 		for range refreshNow.ClickedCh {
-			update()
-			setActionStatus("Manual refresh completed")
+			setActionStatus(refreshStatusMessage(update()))
 		}
 	}()
 
@@ -171,44 +207,65 @@ func watchVRAMSelection(item *systray.MenuItem, mb int) {
 func monitor() {
 	ticker := time.NewTicker(updateInterval)
 	defer ticker.Stop()
-	update()
+	_ = update()
 	for range ticker.C {
-		update()
+		_ = update()
 	}
 }
 
-func update() {
+func update() error {
 	updateMu.Lock()
 	defer updateMu.Unlock()
 
-	v, err := mem.VirtualMemory()
-	if err != nil {
+	snapshot, err := collectRefreshSnapshot(isAppleSilicon)
+	if err != nil && !snapshot.hasRAM {
 		systray.SetTitle("ERR")
-		return
+		if ramDetailItem != nil {
+			ramDetailItem.SetTitle("RAM stats unavailable")
+		}
+		if isAppleSilicon && vramDetailItem != nil {
+			vramDetailItem.SetTitle("VRAM Limit: unavailable (check permissions)")
+		}
+		return err
 	}
 
-	systray.SetTitle(fmt.Sprintf("RAM: %.0f%%", math.Round(v.UsedPercent)))
+	systray.SetTitle(fmt.Sprintf("RAM: %.0f%%", math.Round(snapshot.usedPercent)))
 
-	used := float64(v.Used) / 1024 / 1024 / 1024
-	total := float64(v.Total) / 1024 / 1024 / 1024
+	used := float64(snapshot.usedBytes) / 1024 / 1024 / 1024
+	total := float64(snapshot.totalBytes) / 1024 / 1024 / 1024
 
 	ramDetailItem.SetTitle(
-		fmt.Sprintf("Used: %.1f / %.1f GB (%.0f%%)", used, total, v.UsedPercent),
+		fmt.Sprintf("Used: %.1f / %.1f GB (%.0f%%)", used, total, snapshot.usedPercent),
 	)
 
 	if isAppleSilicon {
-		updateVRAMStatus()
+		if err != nil {
+			vramDetailItem.SetTitle("VRAM Limit: unavailable (check permissions)")
+			return err
+		}
+		setVRAMDetailTitle(snapshot.vramLimitMB)
 	}
+
+	return nil
 }
 
-func updateVRAMStatus() {
+func updateVRAMStatus() error {
 	if vramDetailItem == nil {
-		return
+		return nil
 	}
 
-	current, err := getCurrentVRAMLimitMB()
+	current, err := currentVRAMLimitReader()
 	if err != nil {
 		vramDetailItem.SetTitle("VRAM Limit: unavailable (check permissions)")
+		return fmt.Errorf("refresh VRAM limit: %w", err)
+	}
+
+	setVRAMDetailTitle(current)
+	return nil
+}
+
+func setVRAMDetailTitle(current int) {
+	if vramDetailItem == nil {
 		return
 	}
 
@@ -232,7 +289,7 @@ func updateVRAMStatus() {
 }
 
 func getTotalMemoryMB() int {
-	v, err := mem.VirtualMemory()
+	v, err := virtualMemoryReader()
 	if err != nil {
 		return 0
 	}
@@ -281,6 +338,17 @@ func formatGBFromMB(mb int) string {
 }
 
 func applyVRAMLimit(mb int) {
+	applyVRAMLimitWithSuccessMessage(mb, "")
+}
+
+func applyDefaultVRAMLimit() {
+	applyVRAMLimitWithSuccessMessage(
+		defaultVRAMLimitMB,
+		"Reset to default configuration",
+	)
+}
+
+func applyVRAMLimitWithSuccessMessage(mb int, successMessage string) {
 	if !isAppleSilicon {
 		message := "VRAM control unavailable on this machine"
 		setActionStatus(message)
@@ -302,16 +370,21 @@ func applyVRAMLimit(mb int) {
 		return
 	}
 
-	message := ""
-	if mb == 0 {
-		message = "Set to Dynamic (0 MB)"
-	} else {
-		message = fmt.Sprintf("Set to %d MB (%s)", mb, formatGBFromMB(mb))
+	message := successMessage
+	if message == "" {
+		message = successMessageForVRAMLimit(mb)
 	}
 	setActionStatus(message)
 	notifyVRAMResult(true, message)
 
-	updateVRAMStatus()
+	_ = updateVRAMStatus()
+}
+
+func successMessageForVRAMLimit(mb int) string {
+	if mb == defaultVRAMLimitMB {
+		return "Set to Dynamic (0 MB)"
+	}
+	return fmt.Sprintf("Set to %d MB (%s)", mb, formatGBFromMB(mb))
 }
 
 func setActionStatus(message string) {
@@ -338,10 +411,10 @@ func setVRAMLimitMB(mb int) error {
 		return errors.New("value must be >= 0")
 	}
 
-	command := fmt.Sprintf("/usr/sbin/sysctl -w %s=%d", vramSysctlKey, mb)
+	command := fmt.Sprintf("%s -w %s=%d", sysctlPath, vramSysctlKey, mb)
 	appleScript := fmt.Sprintf(`do shell script %q with administrator privileges`, command)
 
-	out, err := commandCombinedOutput("osascript", "-e", appleScript)
+	out, err := executeCombinedOutput(interactiveAppleScriptSpec(appleScript))
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
 		if msg == "" {
@@ -354,7 +427,7 @@ func setVRAMLimitMB(mb int) error {
 }
 
 func getCurrentVRAMLimitMB() (int, error) {
-	out, err := commandOutput("sysctl", "-n", vramSysctlKey)
+	out, err := executeOutput(sysctlReadSpec("-n", vramSysctlKey))
 	if err != nil {
 		return 0, err
 	}
@@ -380,7 +453,7 @@ func promptCustomVRAM() (int, error) {
 		`text returned of (display dialog %q default answer "" buttons {"Cancel", "Apply"} default button "Apply")`,
 		prompt,
 	)
-	out, err := commandCombinedOutput("osascript", "-e", script)
+	out, err := executeCombinedOutput(interactiveAppleScriptSpec(script))
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
 		if strings.Contains(strings.ToLower(msg), "user canceled") {
@@ -425,6 +498,10 @@ func validateVRAMLimitMB(mb, totalMemMB int) error {
 		return errors.New("value must be >= 0")
 	}
 
+	if totalMemMB == 0 && mb > 0 {
+		return errors.New("value requires detected total memory")
+	}
+
 	maxMB := getMaxVRAMLimitMB(totalMemMB)
 	if maxMB > 0 && mb > maxMB {
 		return fmt.Errorf("value exceeds max %d MB (%s)", maxMB, formatGBFromMB(maxMB))
@@ -433,26 +510,93 @@ func validateVRAMLimitMB(mb, totalMemMB int) error {
 	return nil
 }
 
-func commandOutput(name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+func collectRefreshSnapshot(appleSilicon bool) (refreshSnapshot, error) {
+	v, err := virtualMemoryReader()
+	if err != nil {
+		return refreshSnapshot{}, fmt.Errorf("refresh RAM stats: %w", err)
+	}
+
+	snapshot := refreshSnapshot{
+		hasRAM:      true,
+		usedBytes:   v.Used,
+		totalBytes:  v.Total,
+		usedPercent: v.UsedPercent,
+	}
+
+	if !appleSilicon {
+		return snapshot, nil
+	}
+
+	current, err := currentVRAMLimitReader()
+	if err != nil {
+		return snapshot, fmt.Errorf("refresh VRAM limit: %w", err)
+	}
+
+	snapshot.vramLimitMB = current
+	return snapshot, nil
+}
+
+func sysctlReadSpec(args ...string) commandSpec {
+	return commandSpec{
+		label:   "sysctl",
+		path:    sysctlPath,
+		args:    args,
+		timeout: readCommandTimeout,
+	}
+}
+
+func interactiveAppleScriptSpec(script string) commandSpec {
+	return commandSpec{
+		label: "osascript",
+		path:  osascriptPath,
+		args:  []string{"-e", script},
+	}
+}
+
+func notificationAppleScriptSpec(script string) commandSpec {
+	return commandSpec{
+		label:   "osascript",
+		path:    osascriptPath,
+		args:    []string{"-e", script},
+		timeout: notifyCommandTimeout,
+	}
+}
+
+func executeOutput(spec commandSpec) ([]byte, error) {
+	if spec.timeout <= 0 {
+		return exec.Command(spec.path, spec.args...).Output()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), spec.timeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, name, args...).Output()
+	out, err := exec.CommandContext(ctx, spec.path, spec.args...).Output()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return nil, fmt.Errorf("%s command timed out", name)
+		return nil, fmt.Errorf("%s command timed out", spec.label)
 	}
 	return out, err
 }
 
-func commandCombinedOutput(name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+func executeCombinedOutput(spec commandSpec) ([]byte, error) {
+	if spec.timeout <= 0 {
+		return exec.Command(spec.path, spec.args...).CombinedOutput()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), spec.timeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	out, err := exec.CommandContext(ctx, spec.path, spec.args...).CombinedOutput()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return nil, fmt.Errorf("%s command timed out", name)
+		return nil, fmt.Errorf("%s command timed out", spec.label)
 	}
 	return out, err
+}
+
+func refreshStatusMessage(err error) string {
+	if err != nil {
+		return fmt.Sprintf("Manual refresh failed: %v", err)
+	}
+	return "Manual refresh completed"
 }
 
 func notifyVRAMResult(success bool, message string) {
@@ -477,7 +621,7 @@ func sendNotification(title, message string) {
 	}
 
 	script := fmt.Sprintf(`display notification %q with title %q`, msg, title)
-	_, _ = commandCombinedOutput("osascript", "-e", script)
+	_, _ = executeCombinedOutput(notificationAppleScriptSpec(script))
 }
 
 func onExit() {}

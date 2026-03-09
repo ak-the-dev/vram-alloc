@@ -1,4 +1,4 @@
-module github.com/akshatsharma/vram-alloc
+module github.com/ak-the-dev/vram-alloc
 
 go 1.23
 
